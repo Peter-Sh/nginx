@@ -499,12 +499,11 @@ ngx_http_limit_req_account(ngx_http_limit_req_limit_t *limits, ngx_uint_t n,
 
     excess = *ep;
 
-    if (excess == 0 || (*limit)->nodelay) {
+    if (excess == 0 || ((ngx_uint_t) excess < (*limit)->nodelay)) {
         max_delay = 0;
-
     } else {
         ctx = (*limit)->shm_zone->data;
-        max_delay = excess * 1000 / ctx->rate;
+        max_delay = (excess - (*limit)->nodelay) * 1000 / ctx->rate;
     }
 
     while (n--) {
@@ -544,11 +543,19 @@ ngx_http_limit_req_account(ngx_http_limit_req_limit_t *limits, ngx_uint_t n,
 
         ctx->node = NULL;
 
-        if (limits[n].nodelay) {
+        /*
+        excess = 0 nodelay = 0 false
+        excess = 0 nodelay > 0 true
+        excess > 0 nodelay = 0 false
+        excess > 0 nodelay > 0 excess == nodelay false
+        excess > 0 nodelay > 0 excess > nodelay false
+        excess > 0 nodelay > 0 excess < nodelay true
+        */
+        if ((ngx_uint_t) excess < limits[n].nodelay) {
             continue;
         }
 
-        delay = excess * 1000 / ctx->rate;
+        delay = (excess - limits[n].nodelay) * 1000 / ctx->rate;
 
         if (delay > max_delay) {
             max_delay = delay;
@@ -875,17 +882,19 @@ ngx_http_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_limit_req_conf_t  *lrcf = conf;
 
-    ngx_int_t                    burst;
+    ngx_int_t                    burst, nodelay;
     ngx_str_t                   *value, s;
-    ngx_uint_t                   i, nodelay;
+    ngx_uint_t                   i;
     ngx_shm_zone_t              *shm_zone;
     ngx_http_limit_req_limit_t  *limit, *limits;
+    ngx_flag_t                   has_nodelay;
 
     value = cf->args->elts;
 
     shm_zone = NULL;
     burst = 0;
     nodelay = 0;
+    has_nodelay = 0;
 
     for (i = 1; i < cf->args->nelts; i++) {
 
@@ -915,8 +924,20 @@ ngx_http_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        if (ngx_strcmp(value[i].data, "nodelay") == 0) {
-            nodelay = 1;
+        if (ngx_strncmp(value[i].data, "nodelay=", 8) == 0) {
+            nodelay = ngx_atoi(value[i].data + 8, value[i].len - 8);
+            if (nodelay <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid nodelay value \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+            //#ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            //#                   "nodelay value is %ui", nodelay);
+            continue;
+        } else if (ngx_strcmp(value[i].data, "nodelay") == 0) {
+            has_nodelay = 1;
+            //#ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+            //#                   "has_nodelay");
             continue;
         }
 
@@ -924,6 +945,19 @@ ngx_http_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            "invalid parameter \"%V\"", &value[i]);
         return NGX_CONF_ERROR;
     }
+
+    if (has_nodelay && !nodelay) {
+        nodelay = burst;
+    }
+
+    if (nodelay && nodelay > burst) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "nodelay value should be less or equal to burst");
+        return NGX_CONF_ERROR;
+    }
+
+    //#ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+    //#                   "final nodelay value is %ui", nodelay);
 
     if (shm_zone == NULL) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -956,7 +990,7 @@ ngx_http_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     limit->shm_zone = shm_zone;
     limit->burst = burst * 1000;
-    limit->nodelay = nodelay;
+    limit->nodelay = nodelay * 1000;
 
     return NGX_CONF_OK;
 }
